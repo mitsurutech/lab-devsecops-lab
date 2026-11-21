@@ -1,0 +1,10 @@
+# Publishes the lab on your own machine only (127.0.0.1), for running it outside the platform:
+#   docker compose -f compose.yaml -f local.yaml up
+# then Gitea answers on http://127.0.0.1:3000 (student / student) and the shop on
+# http://127.0.0.1:8000 (as first written) and http://127.0.0.1:8001 (hardened).
+# The shop is insecure on purpose, so keep it on 127.0.0.1.
+services:
+  gitea:
+    ports: ["127.0.0.1:3000:3000"]
+  shop:
+    ports: ["127.0.0.1:8000:8000", "127.0.0.1:8001:8001"]

@@ -1,0 +1,685 @@
+# A DevSecOps pipeline to build and break: a Git server, a small web shop with mistakes left in on
+# purpose, and the open-source scanners a pipeline runs, in a lab of your own.
+#
+# Six services, and nothing outside the lab can reach them:
+#   gitea     A Git server (Gitea) holding student/tuckshop, the shop's repository, with four commits
+#             made at the first start. Account student, password student, both made up. Port 3000.
+#   shop      The tuck shop itself, run from the repository: port 8000 is the shop as first written,
+#             port 8001 the same file run with --hardened, its fixes switched on.
+#   ci        The pipeline's own step runner (Python 3.12): dast.py, a small dynamic scanner written
+#             for this lab in the manner of OWASP ZAP's baseline scan, and gate.py, a security gate
+#             that reads every scanner's report and can set a commit status in Gitea.
+#   semgrep   Semgrep, for static analysis of the code (SAST), offline with local rules.
+#   gitleaks  Gitleaks, for secrets in files and in Git history. It clones the repository into the
+#             shared volume /work at start, where every scanner reads it.
+#   trivy     Trivy, for misconfigurations in the Dockerfile and Terraform (IaC), offline with the
+#             checks built into it.
+# The terminal beside the lab runs each tool with docker exec, for example:
+#   docker exec semgrep semgrep scan --config /work/tuckshop/.semgrep.yml --metrics=off /work/tuckshop
+#
+# Scan and attack only this copy. The shop's mistakes, its one account and the payments key in its
+# history (tuck_live_...) are planted fixtures, made up for the exercises: none is a real credential.
+# Only pip-audit is downloaded, when a lesson installs it from PyPI; every scanner image is pinned by
+# digest. The repository and /work are kept when the lab stops; the step runner's installs are not.
+
+services:
+  gitea:
+    image: gitea/gitea:28.1-rootless@sha256:b1a90409ae9afcd5a5725404c3639da7245248848b99e35332968891290b953e
+    user: "1000:1000"
+    environment:
+      GITEA_APP_INI: /var/lib/gitea/custom/conf/app.ini
+      INSTALL_LOCK: "true"
+      DISABLE_SSH: "true"
+      DISABLE_REGISTRATION: "true"
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__PUBLIC_URL_DETECTION: auto
+      GITEA__server__OFFLINE_MODE: "true"
+      GITEA__repository__DEFAULT_BRANCH: main
+      GITEA__security__MIN_PASSWORD_LENGTH: "6"
+      GITEA__log__LEVEL: warn
+    # Gitea's own entrypoint, with the account and the shop's repository made beside it the first
+    # time. A marker in the volume says it has been done, and the healthcheck waits for the marker.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        (
+          set -e
+          until curl -fs -o /dev/null http://127.0.0.1:3000/api/healthz; do sleep 1; done
+          test -f /var/lib/gitea/seeded && exit 0
+          gitea admin user create --username student --password student \
+            --email student@example.com --must-change-password=false || true
+          curl -fs -o /dev/null -u student:student -H 'Content-Type: application/json' \
+            -d '{"name":"tuckshop","description":"The college tuck shop, with mistakes left in on purpose.","default_branch":"main"}' \
+            http://127.0.0.1:3000/api/v1/user/repos || true
+          rm -rf /tmp/gitea/seed && mkdir -p /tmp/gitea/seed && cd /tmp/gitea/seed
+          git init -q -b main
+          cat > README.md <<'EOF'
+        # tuckshop
+
+        The college tuck shop's web shop, written for this lab with mistakes left in on purpose.
+
+        - app.py is the shop (python3 app.py on port 8000, python3 app.py --hardened on port 8001)
+        - requirements.txt lists the libraries it was meant to use
+        - Dockerfile and deploy/main.tf are how it would be shipped
+        - .semgrep.yml holds the team's first code scanning rules
+
+        Everything in it is made up, including the payments key in its history.
+        EOF
+          cat > app.py <<'EOF'
+        """The tuck shop: a small web shop written for this lab, with mistakes left in on purpose.
+
+        Run as python3 app.py for the shop as first written (port 8000), or python3 app.py --hardened
+        for the same shop with its fixes (port 8001). Nothing here is real: three items and one account.
+        """
+        import hashlib
+        import html
+        import os
+        import sqlite3
+        import subprocess
+        import sys
+        import traceback
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlparse
+
+        from settings import PAYMENTS_KEY
+
+        HARDENED = "--hardened" in sys.argv
+        PORT = 8001 if HARDENED else 8000
+
+        db = sqlite3.connect(":memory:", check_same_thread=False)
+        db.executescript(
+            "create table items (id integer primary key, name text, price text);"
+            "insert into items (name, price) values ('Apple', '0.40'), ('Flapjack', '1.20'), ('Orange juice', '0.90');"
+            "create table users (name text, hash text);"
+        )
+
+
+        def hash_password(password):
+            if HARDENED:
+                return hashlib.scrypt(password.encode(), salt=b"tuckshop-lab", n=2**14, r=8, p=1).hex()
+            return hashlib.md5(password.encode()).hexdigest()
+
+
+        db.execute("insert into users values (?, ?)", ("ana", hash_password("Tuck-Shop-26")))
+
+
+        def search(term):
+            if HARDENED:
+                return db.execute("select name, price from items where name like ?", ("%" + term + "%",)).fetchall()
+            return db.execute("select name, price from items where name like '%" + term + "%'").fetchall()
+
+
+        def item(item_id):
+            row = db.execute("select name, price from items where id = ?", (int(item_id),)).fetchone()
+            if row is None:
+                raise KeyError(item_id)
+            return row
+
+
+        def till_printer_up(host):
+            if HARDENED:
+                return subprocess.run(["ping", "-c", "1", host], capture_output=True).returncode == 0
+            return subprocess.run("ping -c 1 " + host, shell=True, capture_output=True).returncode == 0
+
+
+        def build_date():
+            return subprocess.run("date -u +%Y", shell=True, capture_output=True, text=True).stdout.strip()
+
+
+        class Shop(BaseHTTPRequestHandler):
+            server_version = "tuckshop" if HARDENED else "TuckShop/0.9"
+            sys_version = "" if HARDENED else BaseHTTPRequestHandler.sys_version
+
+            def page(self, status, body, cookie=None):
+                data = ("<!doctype html><title>Tuck shop</title>" + body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                if cookie:
+                    flags = "; HttpOnly; Secure; SameSite=Lax" if HARDENED else ""
+                    self.send_header("Set-Cookie", cookie[0] + "=" + cookie[1] + "; Path=/" + flags)
+                if HARDENED:
+                    self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("X-Frame-Options", "DENY")
+                    self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                url = urlparse(self.path)
+                query = parse_qs(url.query)
+                try:
+                    if url.path == "/health":
+                        return self.page(200, "ok")
+                    if url.path == "/":
+                        links = "".join('<li><a href="/item?id=%d">Item %d</a></li>' % (n, n) for n in (1, 2, 3))
+                        return self.page(200, "<h1>Tuck shop</h1><ul>" + links + "</ul>"
+                                         '<p><a href="/item?id=special">Today\'s special</a></p>'
+                                         '<p><a href="/search?q=apple">Search</a> <a href="/login">Sign in</a></p>',
+                                         cookie=("cart", os.urandom(8).hex()))
+                    if url.path == "/item":
+                        name, price = item(query.get("id", [""])[0])
+                        return self.page(200, "<h1>" + html.escape(name) + "</h1><p>" + price + "</p>")
+                    if url.path == "/search":
+                        term = query.get("q", [""])[0]
+                        shown = html.escape(term) if HARDENED else term
+                        rows = "".join("<li>" + html.escape(n) + " " + p + "</li>" for n, p in search(term))
+                        return self.page(200, "<p>Results for " + shown + "</p><ul>" + rows + "</ul>")
+                    if url.path == "/login":
+                        return self.page(200, '<form method="post" action="/login"><input name="name">'
+                                              '<input name="password" type="password"><button>Sign in</button></form>')
+                    return self.page(404, "<p>Not found</p>")
+                except Exception:
+                    if HARDENED:
+                        return self.page(404, "<p>No such item</p>")
+                    return self.page(500, "<pre>" + html.escape(traceback.format_exc()) + "</pre>")
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                form = parse_qs(self.rfile.read(length).decode())
+                name = form.get("name", [""])[0]
+                given = form.get("password", [""])[0]
+                row = db.execute("select hash from users where name = ?", (name,)).fetchone()
+                if row and row[0] == hash_password(given):
+                    return self.page(200, "<p>Signed in</p>", cookie=("session", os.urandom(16).hex()))
+                return self.page(401, "<p>Wrong name or password</p>")
+
+            def log_message(self, fmt, *args):
+                sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+
+        if __name__ == "__main__":
+            ThreadingHTTPServer(("0.0.0.0", PORT), Shop).serve_forever()
+        EOF
+          cat > requirements.txt <<'EOF'
+        requests==2.19.1
+        PyYAML==5.3
+        Jinja2==2.10
+        EOF
+          cat > Dockerfile <<'EOF'
+        FROM python
+        WORKDIR /app
+        ADD . /app
+        RUN pip install -r requirements.txt
+        EXPOSE 8000
+        CMD ["python3", "app.py"]
+        EOF
+          cat > .semgrep.yml <<'EOF'
+        rules:
+          - id: sql-built-from-strings
+            languages: [python]
+            severity: ERROR
+            message: SQL built by joining strings. Pass the value as a parameter.
+            pattern: $$DB.execute("..." + $$X + "...")
+          - id: weak-password-hash
+            languages: [python]
+            severity: ERROR
+            message: MD5 is far too fast for passwords. Use scrypt or argon2.
+            pattern: hashlib.md5(...)
+          - id: shell-true
+            languages: [python]
+            severity: WARNING
+            message: A command run through the shell.
+            pattern: subprocess.run($$CMD, shell=True, ...)
+        EOF
+          cat > settings.py <<'EOF'
+        import os
+
+        PAYMENTS_KEY = ""
+        EOF
+          git add -A
+          GIT_AUTHOR_DATE=2026-01-05T09:00:00Z GIT_COMMITTER_DATE=2026-01-05T09:00:00Z \
+            git -c user.name='Ana Lab' -c user.email=ana@example.com commit -q -m 'Start the tuck shop'
+          cat > settings.py <<'EOF'
+        PAYMENTS_KEY = "tuck_live_7Gq2Rk9Xw4Lm8Tz1Vb5Nc3Hd"
+        EOF
+          git add -A
+          GIT_AUTHOR_DATE=2026-01-12T10:30:00Z GIT_COMMITTER_DATE=2026-01-12T10:30:00Z \
+            git -c user.name='Ana Lab' -c user.email=ana@example.com commit -q -m 'Add card payments'
+          cat > settings.py <<'EOF'
+        import os
+
+        PAYMENTS_KEY = os.environ.get("PAYMENTS_KEY", "")
+        EOF
+          git add -A
+          GIT_AUTHOR_DATE=2026-01-13T08:15:00Z GIT_COMMITTER_DATE=2026-01-13T08:15:00Z \
+            git -c user.name='Ana Lab' -c user.email=ana@example.com commit -q -m 'Read the payments key from the environment'
+          mkdir deploy
+          cat > deploy/main.tf <<'EOF'
+        resource "aws_s3_bucket" "receipts" {
+          bucket = "tuckshop-receipts"
+        }
+
+        resource "aws_s3_bucket_acl" "receipts" {
+          bucket = aws_s3_bucket.receipts.id
+          acl    = "public-read"
+        }
+
+        resource "aws_security_group" "till" {
+          name = "till"
+          ingress {
+            description = "ssh from anywhere"
+            from_port   = 22
+            to_port     = 22
+            protocol    = "tcp"
+            cidr_blocks = ["0.0.0.0/0"]
+          }
+        }
+        EOF
+          git add -A
+          GIT_AUTHOR_DATE=2026-01-20T14:00:00Z GIT_COMMITTER_DATE=2026-01-20T14:00:00Z \
+            git -c user.name='Ana Lab' -c user.email=ana@example.com commit -q -m 'Describe the cloud it runs in'
+          git push -q http://student:student@127.0.0.1:3000/student/tuckshop.git main
+          cd / && rm -rf /tmp/gitea/seed
+          touch /var/lib/gitea/seeded
+        ) &
+        exec /usr/bin/dumb-init -- /usr/local/bin/docker-entrypoint.sh
+    volumes:
+      - gitea:/var/lib/gitea
+    expose: ["3000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs -o /dev/null http://127.0.0.1:3000/api/healthz && test -f /var/lib/gitea/seeded"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    labels:
+      lab.title: Gitea
+      lab.open: "3000"
+
+  gitleaks:
+    image: zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+    # Root in its own container, so it can make /work's folders writable for the other scanners.
+    working_dir: /work
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mkdir -p /work/reports /work/rules
+        chmod 777 /work/reports /work/rules
+        until test -f /work/tuckshop/app.py; do
+          rm -rf /work/tuckshop
+          git clone -q http://gitea:3000/student/tuckshop.git /work/tuckshop || sleep 2
+        done
+        exec tail -f /dev/null
+    depends_on:
+      gitea:
+        condition: service_healthy
+    volumes:
+      - work:/work
+    healthcheck:
+      test: ["CMD", "test", "-f", "/work/tuckshop/app.py"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  shop:
+    image: python:3.12.15-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
+    user: "65532:65532"
+    environment:
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    # Runs the shop straight from the clone in /work, so a fix pulled there and a restart of this
+    # service is the shop changed: docker restart shop.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        until test -f /work/tuckshop/app.py; do sleep 1; done
+        cd /work/tuckshop
+        python3 app.py --hardened &
+        exec python3 app.py
+    depends_on:
+      gitleaks:
+        condition: service_healthy
+    volumes:
+      - work:/work:ro
+    expose: ["8000", "8001"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=2); u.urlopen('http://127.0.0.1:8001/health', timeout=2)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+    labels:
+      lab.title: Tuck shop
+      lab.open: "8000"
+
+  ci:
+    image: python:3.12.15-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d
+    user: "65532:65532"
+    working_dir: /tmp
+    environment:
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cd /tmp
+        cat > dast.py <<'EOF'
+        """A small dynamic scanner written for this lab, in the manner of OWASP ZAP's baseline scan.
+
+        It crawls a site from one address, staying on that host, and checks every page it fetched.
+        Passive checks (always) only read what came back: headers, cookies and error pages.
+        Active checks (--active) send one harmless probe per query parameter and look for it,
+        unescaped, in the reply. Run it only against your own lab copy.
+
+          python3 dast.py http://shop:8000/ [--active] [--config rules.conf] [--json report.json]
+
+        A config file has one rule a line: the rule's number, then IGNORE, WARN or FAIL, then a reason.
+        The scan exits 1 if any rule set to FAIL found something, and 0 otherwise.
+        """
+        import json
+        import re
+        import sys
+        import urllib.error
+        import urllib.request
+        from html.parser import HTMLParser
+        from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+
+        RULES = {
+            1: ("Content-Security-Policy header missing", "Medium"),
+            2: ("X-Content-Type-Options header missing", "Low"),
+            3: ("Page can be framed (no X-Frame-Options or frame-ancestors)", "Medium"),
+            4: ("Server header gives away a version", "Low"),
+            5: ("Cookie without HttpOnly", "Low"),
+            6: ("Cookie without SameSite", "Low"),
+            7: ("Error page shows a stack trace", "Medium"),
+            8: ("Input reflected without escaping (active)", "High"),
+        }
+        PROBE = "dast<i>probe</i>"
+        MOST_PAGES = 20
+
+
+        class Links(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.found = []
+
+            def handle_starttag(self, tag, attrs):
+                for name, value in attrs:
+                    if name in ("href", "action") and value:
+                        self.found.append(value)
+
+
+        def fetch(url, method="GET"):
+            request = urllib.request.Request(url, method=method, headers={"User-Agent": "lab-dast"})
+            try:
+                with urllib.request.urlopen(request, timeout=5) as reply:
+                    return reply.status, reply.headers, reply.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as error:
+                return error.code, error.headers, error.read().decode("utf-8", "replace")
+
+
+        def crawl(start):
+            host = urlparse(start).netloc
+            queue, seen, pages = [start], set(), []
+            while queue and len(pages) < MOST_PAGES:
+                url = queue.pop(0)
+                if url in seen:
+                    continue
+                seen.add(url)
+                status, headers, body = fetch(url)
+                pages.append((url, status, headers, body))
+                parser = Links()
+                parser.feed(body)
+                for link in parser.found:
+                    full = urljoin(url, link).split("#")[0]
+                    if urlparse(full).netloc == host and full not in seen:
+                        queue.append(full)
+            return pages
+
+
+        def passive(pages):
+            found = {number: [] for number in RULES}
+            for url, status, headers, body in pages:
+                if "text/html" in headers.get("Content-Type", ""):
+                    if not headers.get("Content-Security-Policy"):
+                        found[1].append(url)
+                    policy = headers.get("Content-Security-Policy", "")
+                    if not headers.get("X-Frame-Options") and "frame-ancestors" not in policy:
+                        found[3].append(url)
+                if headers.get("X-Content-Type-Options", "").lower() != "nosniff":
+                    found[2].append(url)
+                if re.search(r"[0-9]", headers.get("Server", "")):
+                    found[4].append(url)
+                for cookie in headers.get_all("Set-Cookie") or []:
+                    if "httponly" not in cookie.lower():
+                        found[5].append(url)
+                    if "samesite" not in cookie.lower():
+                        found[6].append(url)
+                if "Traceback (most recent call last)" in body:
+                    found[7].append(url)
+            return found
+
+
+        def active(pages, found):
+            for url, status, headers, body in pages:
+                parts = urlparse(url)
+                params = parse_qsl(parts.query)
+                for index in range(len(params)):
+                    changed = list(params)
+                    changed[index] = (changed[index][0], PROBE)
+                    probe = parts._replace(query=urlencode(changed)).geturl()
+                    if PROBE in fetch(probe)[2]:
+                        found[8].append(probe)
+
+
+        def read_config(path):
+            levels = {}
+            for line in open(path, encoding="utf-8"):
+                words = line.split(None, 2)
+                if len(words) >= 2 and words[0].isdigit():
+                    levels[int(words[0])] = words[1].upper()
+            return levels
+
+
+        def main(argv):
+            start = argv[0]
+            levels = read_config(argv[argv.index("--config") + 1]) if "--config" in argv else {}
+            pages = crawl(start)
+            found = passive(pages)
+            if "--active" in argv:
+                active(pages, found)
+            print("Scanned", len(pages), "pages from", start, "(active)" if "--active" in argv else "(passive)")
+            counts = {"FAIL": 0, "WARN": 0, "IGNORE": 0, "PASS": 0}
+            report = []
+            for number, (name, risk) in RULES.items():
+                if number == 8 and "--active" not in argv:
+                    continue
+                urls = found[number]
+                level = levels.get(number, "WARN") if urls else "PASS"
+                counts[level] += 1
+                if urls and not level == "IGNORE":
+                    print("%s: %s [%d] %s x %d" % (level, name, number, risk, len(urls)))
+                    print("    " + urls[0])
+                report.append({"rule": number, "name": name, "risk": risk, "level": level, "urls": urls})
+            print("FAIL: %d  WARN: %d  IGNORE: %d  PASS: %d" % (counts["FAIL"], counts["WARN"], counts["IGNORE"], counts["PASS"]))
+            if "--json" in argv:
+                with open(argv[argv.index("--json") + 1], "w", encoding="utf-8") as out:
+                    json.dump({"target": start, "findings": report}, out, indent=1)
+            return 1 if counts["FAIL"] else 0
+
+
+        if __name__ == "__main__":
+            sys.exit(main(sys.argv[1:]))
+        EOF
+        cat > gate.py <<'EOF'
+        """A security gate written for this lab: one decision from every scanner's report.
+
+        It reads the JSON reports in /work/reports (semgrep.json, gitleaks.json, audit.json, trivy.json,
+        dast.json; a missing one is skipped), gives every finding a severity on one scale, drops what the
+        policy's baseline accepts until its date, and fails if anything left is at or above the policy's
+        level. The policy is security-policy.json at the top of the repository, so it is reviewed like code:
+
+          {"fail_at": "high", "baseline": [{"key": "trivy:DS-0026:Dockerfile", "reason": "...", "expires": "2026-12-31"}]}
+
+          python3 gate.py [--post BRANCH]
+
+        With --post it also sets the commit status "security-gate" on that branch's newest commit in the
+        lab's Gitea, which a protected branch can require before a merge. It exits 1 when the gate fails.
+        """
+        import base64
+        import datetime
+        import json
+        import os
+        import sys
+        import urllib.request
+
+        REPORTS = "/work/reports"
+        REPO = "/work/tuckshop"
+        GITEA = "http://gitea:3000/api/v1/repos/student/tuckshop"
+        SCALE = ["low", "medium", "high", "critical"]
+
+
+        def load(name):
+            path = os.path.join(REPORTS, name)
+            if not os.path.exists(path):
+                return None
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+
+
+        def findings():
+            found = []
+            report = load("semgrep.json")
+            for result in (report or {}).get("results", []):
+                level = {"ERROR": "high", "WARNING": "medium"}.get(result["extra"]["severity"], "low")
+                rule = result["check_id"].split(".")[-1]
+                found.append(("semgrep", rule, result["path"].replace(REPO + "/", ""), level))
+            for leak in load("gitleaks.json") or []:
+                found.append(("gitleaks", leak["RuleID"], leak["File"], "critical"))
+            report = load("audit.json")
+            for package in (report or {}).get("dependencies", []):
+                for vuln in package.get("vulns", []):
+                    found.append(("pip-audit", vuln["id"], package["name"], "high"))
+            report = load("trivy.json")
+            for result in (report or {}).get("Results", []):
+                for item in result.get("Misconfigurations", []):
+                    found.append(("trivy", item["ID"], result["Target"], item["Severity"].lower()))
+            report = load("dast.json")
+            for item in (report or {}).get("findings", []):
+                if item["urls"]:
+                    found.append(("dast", str(item["rule"]), item["name"], item["risk"].lower()))
+            return sorted(set(found))
+
+
+        def policy():
+            path = os.path.join(REPO, "security-policy.json")
+            if not os.path.exists(path):
+                return {"fail_at": "high", "baseline": []}
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+
+
+        def accepted(rules, today):
+            keep = set()
+            for entry in rules.get("baseline", []):
+                if entry.get("reason") and entry.get("expires", "") >= today:
+                    keep.add(entry["key"])
+                else:
+                    print("Baseline entry ignored (no reason, or past its date):", entry["key"])
+            return keep
+
+
+        def post(branch, state, words):
+            auth = "Basic " + base64.b64encode(b"student:student").decode()
+            with urllib.request.urlopen(urllib.request.Request(GITEA + "/branches/" + branch, headers={"Authorization": auth})) as reply:
+                sha = json.load(reply)["commit"]["id"]
+            body = json.dumps({"state": state, "context": "security-gate", "description": words}).encode()
+            request = urllib.request.Request(GITEA + "/statuses/" + sha, data=body, method="POST",
+                                             headers={"Authorization": auth, "Content-Type": "application/json"})
+            urllib.request.urlopen(request).close()
+            print("Status", state, "set on", branch, sha[:10])
+
+
+        def main(argv):
+            rules = policy()
+            today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+            keep = accepted(rules, today)
+            floor = SCALE.index(rules.get("fail_at", "high"))
+            blocking = []
+            tools = {}
+            for tool, rule, where, level in findings():
+                tools.setdefault(tool, []).append(level)
+                key = tool + ":" + rule + ":" + where
+                if SCALE.index(level) >= floor and key not in keep:
+                    blocking.append((tool, rule, where, level))
+            for tool, levels in tools.items():
+                print("%-10s %d findings (%s)" % (tool, len(levels), ", ".join(
+                    "%d %s" % (levels.count(name), name) for name in reversed(SCALE) if name in levels)))
+            print("Blocking, at or above %s and not accepted: %d" % (SCALE[floor], len(blocking)))
+            for tool, rule, where, level in blocking:
+                print("  %-10s %-28s %-24s %s" % (tool, rule, where, level))
+            passed = not blocking
+            print("Gate:", "PASS" if passed else "FAIL")
+            if "--post" in argv:
+                words = "no blocking findings" if passed else "%d blocking findings" % len(blocking)
+                post(argv[argv.index("--post") + 1], "success" if passed else "failure", words)
+            return 0 if passed else 1
+
+
+        if __name__ == "__main__":
+            sys.exit(main(sys.argv[1:]))
+        EOF
+        exec tail -f /dev/null
+    volumes:
+      - work:/work
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/gate.py"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  semgrep:
+    image: semgrep/semgrep:1.185.0@sha256:67518c174185a2043fdbed16c70631b79209499b3671178e7194379b48295a0d
+    working_dir: /work
+    environment:
+      SEMGREP_ENABLE_VERSION_CHECK: "0"
+      SEMGREP_SEND_METRICS: "off"
+    entrypoint: ["tail", "-f", "/dev/null"]
+    volumes:
+      - work:/work
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  trivy:
+    image: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+    working_dir: /work
+    environment:
+      TRIVY_SKIP_CHECK_UPDATE: "true"
+      TRIVY_SKIP_VERSION_CHECK: "true"
+      TRIVY_DISABLE_TELEMETRY: "true"
+    entrypoint: ["tail", "-f", "/dev/null"]
+    volumes:
+      - work:/work
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  gitea:
+  work:
