@@ -680,6 +680,7 @@ services:
         limits:
           memory: 256M
 
+# Two named volumes, kept with the copy: Gitea's data, and /work, the shared clone and reports.
 volumes:
-  gitea:
-  work:
+  gitea: {}
+  work: {}
