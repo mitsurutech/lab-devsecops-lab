@@ -1,5 +1,7 @@
 # DevSecOps pipeline lab with Docker Compose: Semgrep, Gitleaks, pip-audit, Trivy and a security gate
 
+[English](README.md) | [Français](README.fr.md) | [Español](README.es.md) | [日本語](README.ja.md) | [Deutsch](README.de.md)
+
 [![check](https://github.com/mitsurutech/lab-devsecops-lab/actions/workflows/check.yml/badge.svg)](https://github.com/mitsurutech/lab-devsecops-lab/actions/workflows/check.yml)
 
 A ready-made lab for classrooms, from the [MitsuruTech Learning Platform](https://mitsurutech.co.uk/learning), where schools, colleges and universities give every student their own databases, containers and terminal in the browser. It teaches DevSecOps by building a security pipeline around a small web shop that has mistakes left in on purpose: static analysis with Semgrep, secret scanning of files and Git history with Gitleaks, dependency scanning with pip-audit, a dynamic baseline scan of the running shop, infrastructure as code scanning with Trivy, and a security gate that sets a commit status in Gitea so a protected branch refuses a merge until the gate passes. It is the lab behind the [DevSecOps pipelines](https://mitsurutech.co.uk/resources/university/devsecops-pipeline) module.
